@@ -1482,7 +1482,137 @@ From the FlashAttention implementation on Wormhole/Blackhole:
 > "Like all kernels written in the TT-Metal stack, our FlashAttention kernel takes advantage of concurrent reader, writer, and compute kernels to overlap data movement with compute. The RISCs within a Tensix synchronize using circular buffers, which can be thought of as thread-safe producer/consumer queues."
 > -- *FlashAttention tech report*
 
-### 5.2 Double and Triple Buffering
+### 5.2 Types of Parallelism in TT-Metal
+
+TT-Metal exploits multiple levels of parallelism to maximize hardware utilization:
+
+#### 1. Data Parallelism (Across Cores)
+
+Distribute independent chunks of data across multiple Tensix cores. Each core processes its chunk simultaneously.
+
+```
+Example: Element-wise operations (RMSNorm, activations)
+
+Input tensor: [1, 32, 8192]  (32 tokens × 8192 hidden dim)
+
+Shard across 64 cores:
+  Core 0:  processes elements [0:128]
+  Core 1:  processes elements [128:256]
+  Core 2:  processes elements [256:384]
+  ...
+  Core 63: processes elements [8064:8192]
+
+All 64 cores execute in parallel → 64x speedup over single core!
+```
+
+**When to use**: Operations where each output element depends only on corresponding input elements (no cross-element dependencies).
+
+#### 2. Tensor Parallelism (Splitting Weight Matrices)
+
+For large matrix multiplications, split the weight matrix across cores and combine results:
+
+```
+Example: MLP projection [B, S, 4096] @ [4096, 14336]
+
+Column-parallel split across 8 cores:
+  Core 0: computes output columns [0:1792]      using weight slice [4096, 1792]
+  Core 1: computes output columns [1792:3584]   using weight slice [4096, 1792]
+  ...
+  Core 7: computes output columns [12544:14336] using weight slice [4096, 1792]
+
+Each core holds 1/8 of the weights → fits in L1!
+Results concatenated via AllGather on NoC.
+```
+
+**When to use**: Weight matrices too large for single-core L1. Common for all linear layers in LLMs.
+
+#### 3. Pipeline Parallelism (Across Stages)
+
+Different cores handle different stages of computation, passing results via the NoC:
+
+```
+Example: Multi-layer transformer decode
+
+Stage assignment (simplified):
+  Cores 0-15:  Layer 0 (attention + MLP)
+  Cores 16-31: Layer 1
+  Cores 32-47: Layer 2
+  ...
+
+Token flow:
+  Token 1: [Layer 0] → [Layer 1] → [Layer 2] → ...
+  Token 2:            [Layer 0] → [Layer 1] → [Layer 2] → ...
+  Token 3:                        [Layer 0] → [Layer 1] → ...
+
+Multiple tokens in flight simultaneously!
+```
+
+**When to use**: Sequential operations with independent inputs (autoregressive decode).
+
+#### 4. Instruction-Level Parallelism (Within a Core)
+
+The 5 RISC-V processors within each Tensix run concurrently:
+
+```
+Within a single Tensix core:
+  BRISC (Reader):  Fetching tile N+2 from DRAM
+  NCRISC (Writer): Writing tile N-1 to DRAM
+  TRISC0:          Unpacking tile N from CB to SREG
+  TRISC1:          Computing matmul on tile N-1
+  TRISC2:          Packing tile N-2 from DST to CB
+
+5 operations happening simultaneously!
+```
+
+**When to use**: Always! This is the fundamental TT-Metal execution model.
+
+#### 5. Memory-Level Parallelism (Multiple Outstanding Requests)
+
+Issue multiple memory requests without waiting for each to complete:
+
+```cpp
+// Bad: Sequential reads (high latency)
+for (int i = 0; i < 8; i++) {
+    noc_async_read(src[i], dst[i], size);
+    noc_async_read_barrier();  // Wait after EACH read
+}
+
+// Good: Parallel reads (latency hidden)
+for (int i = 0; i < 8; i++) {
+    noc_async_read(src[i], dst[i], size);  // Issue all reads
+}
+noc_async_read_barrier();  // Wait once for ALL reads
+```
+
+With transaction IDs, you can have even finer control:
+```cpp
+// Issue reads with different transaction IDs
+noc_async_read_set_trid(1);
+noc_async_read(src_a, dst_a, size);
+
+noc_async_read_set_trid(2);
+noc_async_read(src_b, dst_b, size);
+
+// Can barrier on specific transaction
+noc_async_read_barrier_with_trid(1);  // Only wait for trid=1
+// trid=2 might still be in flight!
+```
+
+**Performance impact**: Memory-level parallelism is critical for saturating DRAM bandwidth. A single outstanding request can't keep the memory system busy.
+
+#### Parallelism Summary
+
+| Level | What's Parallelized | Speedup Source | TT-Metal Mechanism |
+|-------|---------------------|----------------|-------------------|
+| Data | Independent data chunks | More cores working | Sharding, grid of cores |
+| Tensor | Weight matrix slices | Fits in L1, parallel matmul | Column/row sharding |
+| Pipeline | Sequential stages | Overlap layers/tokens | Multi-core programs |
+| Instruction | Reader/compute/writer | Hide latency | 5 RISC-V per Tensix |
+| Memory | Outstanding requests | Saturate BW | Async NOC, transaction IDs |
+
+**Key insight**: TT-Metal's architecture enables exploiting ALL these parallelism levels simultaneously. A well-optimized kernel uses data parallelism across cores, tensor parallelism for large matrices, instruction-level parallelism within each core, and memory-level parallelism for all data movement.
+
+### 5.3 Double and Triple Buffering
 
 By sizing circular buffers to hold 2 or 3 tiles instead of 1, we enable the reader to pre-fetch the next tile while compute is processing the current one:
 
